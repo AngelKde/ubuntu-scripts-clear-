@@ -1,14 +1,13 @@
 
 #!/bin/bash
-# ...existing code...
 set -euo pipefail
 
 # Script di pulizia sicuro per Ubuntu 24.04 LTS con interfaccia grafica (Zenity)
 # Modalità dry-run inclusa
 # Avviabile con doppio click
 
-# evita errori con -u
-DRY_RUN="false"
+# Variabili globali
+DRY_RUN="${DRY_RUN:-false}"
 DRY_ESCALATED="${DRY_ESCALATED:-0}"
 
 # Controlla se zenity è installato
@@ -19,29 +18,18 @@ fi
 
 # Se necessario, rilancia con privilegi (pkexec preferito)
 if [ "${DRY_ESCALATED}" != "1" ] && [ "$EUID" -ne 0 ]; then
-    # Chiedi se l'utente vuole la modalità dry-run prima dell'escalation:
+    # Chiedi se l'utente vuole la modalità dry-run prima dell'escalation
     if zenity --question --title="Pulizia Sistema" --text="Vuoi eseguire la pulizia in modalità simulazione (dry-run)?" --ok-label="Sì" --cancel-label="No"; then
-        DRY_RUN="true"
+        DRY_RUN_CHOICE="true"
     else
-        DRY_RUN="false"
+        DRY_RUN_CHOICE="false"
     fi
 
-    if [ "${DRY_RUN}" != "true" ]; then
-        if command -v pkexec &>/dev/null; then
-            # pkexec spesso resetta l'ambiente; passiamo le variabili essenziali
-            exec env DRY_ESCALATED=1 pkexec env DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" bash "$0" "$@"
-        else
-            exec env DRY_ESCALATED=1 sudo -E bash "$0" "$@"
-        fi
-    fi
-else
-    # Se siamo già root o dry-run, conferma dry-run (se non impostato)
-    if [ "${DRY_RUN:-}" != "true" ] && [ "${DRY_RUN:-}" != "false" ]; then
-        if zenity --question --title="Pulizia Sistema" --text="Vuoi eseguire la pulizia in modalità simulazione (dry-run)?" --ok-label="Sì" --cancel-label="No"; then
-            DRY_RUN="true"
-        else
-            DRY_RUN="false"
-        fi
+    # Rilancia con privilegi passando la scelta dry-run
+    if command -v pkexec &>/dev/null; then
+        exec env DRY_ESCALATED=1 DRY_RUN="${DRY_RUN_CHOICE}" pkexec env DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" bash "$0" "$@"
+    else
+        exec env DRY_ESCALATED=1 DRY_RUN="${DRY_RUN_CHOICE}" sudo -E bash "$0" "$@"
     fi
 fi
 
@@ -52,61 +40,87 @@ on_abort() {
 }
 trap 'on_abort' TERM INT
 
-DRY_SUMMARY=""
+# File temporaneo per il riepilogo dry-run
+DRY_SUMMARY_FILE=$(mktemp)
+trap 'rm -f "${DRY_SUMMARY_FILE}"' EXIT
 
-# Produzione dei messaggi di progresso (non aprire altre finestre zenity qui)
+# Percorsi assoluti per i comandi principali
+APT_CMD="/usr/bin/apt"
+JOURNALCTL_CMD="/usr/bin/journalctl"
+
+# Funzione per aggiungere al riepilogo
+add_to_summary() {
+    echo "$1" >> "${DRY_SUMMARY_FILE}"
+}
+
+# Produzione dei messaggi di progresso
 (
 echo "0"; sleep 0.2
 
 # 1. Autoremove + purge
 if [ "${DRY_RUN}" = "true" ]; then
-    DRY_SUMMARY+="🔄 [Dry-run] Verifica dei pacchetti da rimuovere (apt autoremove --purge)\n"
+    REMOVABLE=$("${APT_CMD}" --dry-run autoremove --purge 2>/dev/null | grep -c "^Remv " || echo "0")
+    add_to_summary "🔄 [Dry-run] Pacchetti da rimuovere: ${REMOVABLE} (apt autoremove --purge)"
+    echo "20"
 else
-    echo "10"; sleep 0.1
-    apt -y autoremove --purge
+    echo "10"
+    "${APT_CMD}" -y autoremove --purge
+    echo "20"
 fi
-echo "20"; sleep 0.1
+sleep 0.1
 
 # 2. Autoclean
 if [ "${DRY_RUN}" = "true" ]; then
-    DRY_SUMMARY+="🗑️ [Dry-run] Pulizia dei pacchetti obsoleti (apt autoclean)\n"
+    add_to_summary "🗑️ [Dry-run] Pulizia dei pacchetti obsoleti (apt autoclean)"
+    echo "40"
 else
-    echo "30"; sleep 0.1
-    apt -y autoclean
+    echo "30"
+    "${APT_CMD}" -y autoclean
+    echo "40"
 fi
-echo "50"; sleep 0.1
+sleep 0.1
 
 # 3. Clean
 if [ "${DRY_RUN}" = "true" ]; then
-    DRY_SUMMARY+="🧹 [Dry-run] Pulizia completa della cache APT (apt clean)\n"
+    CACHE_SIZE=$(du -sh /var/cache/apt/archives 2>/dev/null | cut -f1 || echo "N/A")
+    add_to_summary "🧹 [Dry-run] Cache APT da pulire: ${CACHE_SIZE} (apt clean)"
+    echo "60"
 else
-    echo "60"; sleep 0.1
-    apt clean
+    echo "50"
+    "${APT_CMD}" clean
+    echo "60"
 fi
-echo "70"; sleep 0.1
+sleep 0.1
 
 # 4. Journald
 if [ "${DRY_RUN}" = "true" ]; then
-    DRY_SUMMARY+="📜 [Dry-run] Rimozione log journald più vecchi di 7 giorni (journalctl --vacuum-time=7d)\n"
+    JOURNAL_SIZE=$("${JOURNALCTL_CMD}" --disk-usage 2>/dev/null | grep -oP '\d+\.\d+[GM]' | head -1 || echo "N/A")
+    add_to_summary "📜 [Dry-run] Log journald attuali: ${JOURNAL_SIZE}, verranno rimossi quelli oltre 7 giorni"
+    echo "80"
 else
-    echo "75"; sleep 0.1
-    journalctl --vacuum-time=7d || true
+    echo "70"
+    "${JOURNALCTL_CMD}" --vacuum-time=7d || true
+    echo "80"
 fi
-echo "85"; sleep 0.1
+sleep 0.1
 
 # 5. Cache miniature
 THUMB_DIR="${HOME}/.cache/thumbnails"
 if [ -d "${THUMB_DIR}" ]; then
     if [ "${DRY_RUN}" = "true" ]; then
-        NUM_FILES=$(find "${THUMB_DIR}" -type f | wc -l)
-        DRY_SUMMARY+="🖼️ [Dry-run] Cache miniature: ${NUM_FILES} file verrebbero rimossi.\n"
+        NUM_FILES=$(find "${THUMB_DIR}" -type f 2>/dev/null | wc -l)
+        THUMB_SIZE=$(du -sh "${THUMB_DIR}" 2>/dev/null | cut -f1 || echo "N/A")
+        add_to_summary "🖼️ [Dry-run] Cache miniature: ${NUM_FILES} file (${THUMB_SIZE}) verrebbero rimossi"
+        echo "100"
     else
-        echo "90"; sleep 0.1
-        # Rimuove solo il contenuto della directory, preservandone la struttura
-        find "${THUMB_DIR}" -mindepth 1 -delete || true
+        echo "90"
+        find "${THUMB_DIR}" -mindepth 1 -delete 2>/dev/null || true
+        echo "100"
     fi
+else
+    echo "100"
 fi
-echo "100"; sleep 0.1
+sleep 0.1
 
 ) | zenity --progress \
            --title="Pulizia Sistema" \
@@ -114,7 +128,7 @@ echo "100"; sleep 0.1
            --percentage=0 \
            --auto-close
 
-# salva lo stato della pipe immediatamente
+# Salva lo stato della pipe immediatamente
 PIPE_STATUS=("${PIPESTATUS[@]}")
 
 # Controlla se zenity è stato annullato (indice 1 della pipe)
@@ -125,14 +139,10 @@ fi
 
 # Fine: mostra riepilogo per dry-run o conferma
 if [ "${DRY_RUN}" = "true" ]; then
-    if [ -z "${DRY_SUMMARY}" ]; then
+    if [ ! -s "${DRY_SUMMARY_FILE}" ]; then
         zenity --info --title="Dry-run completato" --text="Nessuna azione da simulare."
     else
-        # se il riepilogo è lungo, usare text-info con file temporaneo
-        TMP=$(mktemp)
-        printf '%b\n' "${DRY_SUMMARY}" > "${TMP}"
-        zenity --text-info --title="Dry-run - Azioni simulate" --filename="${TMP}" --width=600 --height=400
-        rm -f "${TMP}"
+        zenity --text-info --title="Dry-run - Azioni simulate" --filename="${DRY_SUMMARY_FILE}" --width=600 --height=400
     fi
 else
     zenity --info --title="Pulizia completata" --text="✅ Pulizia del sistema completata!"
